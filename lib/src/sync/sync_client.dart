@@ -58,12 +58,28 @@ class FullSyncRequest extends SyncMessage {
   @override
   final String objectId;
   final List<String> heads;
+  final List<RawChange> changes;
   final List<String> snapshotPath;
 
   FullSyncRequest({
     required this.objectId,
     required this.heads,
+    this.changes = const [],
     this.snapshotPath = const [],
+  });
+}
+
+/// Error response for a sync request.
+class SyncErrorResponse extends SyncMessage {
+  @override
+  final String objectId;
+  final String error;
+  final int errCode;
+
+  SyncErrorResponse({
+    required this.objectId,
+    required this.error,
+    this.errCode = 0,
   });
 }
 

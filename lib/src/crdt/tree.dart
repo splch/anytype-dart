@@ -155,6 +155,11 @@ class Tree {
         continue;
       }
 
+      // Sort previousIds for determinism (matches Go: tree.go line 232)
+      if (change.previousIds.length > 1) {
+        change.previousIds.sort();
+      }
+
       final canAttach = _canAttach(change, addToWaitList: true);
       if (canAttach) {
         _attach(change);

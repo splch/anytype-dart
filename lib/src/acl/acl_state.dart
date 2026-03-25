@@ -112,6 +112,12 @@ enum AclOpType {
   readKeyChange,
   ownershipChange,
   joinWithoutApprove,
+  accountsAdd,
+  requestCancel,
+  requestRemove,
+  inviteChange,
+  permissionChanges,
+  spaceOptionsChange,
 }
 
 /// A single ACL record in the chain.
@@ -198,17 +204,50 @@ class AclState {
     return _users[identityHex]?.permissions ?? Permission.none;
   }
 
+  /// Per-user permission change history for historical lookups.
+  final Map<String, List<_PermissionEntry>> _permissionHistory = {};
+
+  /// Whether this is a one-to-one space (no further records allowed).
+  bool _isOneToOne = false;
+
+  /// Space options (e.g., deleteRestricted).
+  final Map<String, dynamic> _spaceOptions = {};
+
+  /// Whether this is a one-to-one space.
+  bool get isOneToOne => _isOneToOne;
+
   /// Gets a user's permission level at a specific ACL record.
   ///
-  /// Returns the permission as of record [atRecordId] — used to
-  /// validate that a change was authorized at the time it was created.
+  /// Replays the permission history to find the closest permission
+  /// at or before the given record (matches Go closestPermissions).
   Permission permissionsAtRecord(String atRecordId, String identityHex) {
-    // For simplicity, return current permissions if the record is in our chain.
-    // A full implementation would replay the chain up to atRecordId.
-    if (_recordOrder.contains(atRecordId) || atRecordId == _rootId) {
-      return permissionsFor(identityHex);
+    if (!_recordOrder.contains(atRecordId) && atRecordId != _rootId) {
+      return Permission.none;
     }
-    return Permission.none;
+
+    final history = _permissionHistory[identityHex];
+    if (history == null || history.isEmpty) {
+      return _users[identityHex]?.permissions ?? Permission.none;
+    }
+
+    // Find the target record's position in the chain
+    final targetIdx = atRecordId == _rootId
+        ? -1
+        : _recordOrder.indexOf(atRecordId);
+
+    // Walk backwards through history to find the permission at or before target
+    Permission result = Permission.none;
+    for (final entry in history) {
+      final entryIdx = entry.recordId == _rootId
+          ? -1
+          : _recordOrder.indexOf(entry.recordId);
+      if (entryIdx <= targetIdx) {
+        result = entry.permission;
+      } else {
+        break;
+      }
+    }
+    return result;
   }
 
   /// Whether [recordA] comes after [recordB] in the chain.
@@ -221,9 +260,27 @@ class AclState {
 
   /// Applies an ACL record to the state.
   ///
-  /// Records must be applied in chain order (each record's prevId
-  /// must match the current head).
+  /// Records must be applied in chain order. The record's prevId
+  /// must match the current head (strict chain validation, matching
+  /// Go validator.go ValidateAclRecordContents).
+  ///
+  /// Throws [StateError] if the record breaks the chain.
   void applyRecord(AclRecord record) {
+    // Strict chain validation (matches Go: ch.PrevId != c.aclState.lastRecordId)
+    if (record.opType != AclOpType.root) {
+      final expectedPrev = headId;
+      if (record.prevId != expectedPrev) {
+        throw StateError(
+          'ACL chain broken: record ${record.id} has prevId '
+          '"${record.prevId}" but head is "$expectedPrev"',
+        );
+      }
+      // Reject records on one-to-one spaces
+      if (_isOneToOne) {
+        throw StateError('Cannot add records to one-to-one space');
+      }
+    }
+
     switch (record.opType) {
       case AclOpType.root:
         _applyRoot(record);
@@ -241,12 +298,25 @@ class AclState {
         _applyAccountRemove(record);
       case AclOpType.permissionChange:
         _applyPermissionChange(record);
+      case AclOpType.permissionChanges:
+        _applyPermissionChanges(record);
       case AclOpType.readKeyChange:
         _applyReadKeyChange(record);
       case AclOpType.ownershipChange:
         _applyOwnershipChange(record);
       case AclOpType.joinWithoutApprove:
         _applyJoinWithoutApprove(record);
+      case AclOpType.accountsAdd:
+        _applyAccountsAdd(record);
+      case AclOpType.requestCancel:
+        _requests.remove(record.data['requestRecordId'] as String?);
+      case AclOpType.requestRemove:
+        final identityHex = _hexEncode(record.identity);
+        _users.remove(identityHex);
+      case AclOpType.inviteChange:
+        _applyInviteChange(record);
+      case AclOpType.spaceOptionsChange:
+        _applySpaceOptionsChange(record);
     }
     _recordOrder.add(record.id);
   }
@@ -273,6 +343,9 @@ class AclState {
       identity: record.identity,
       permissions: Permission.owner,
       encryptedReadKey: record.data['encryptedReadKey'] as Uint8List?,
+    );
+    _permissionHistory.putIfAbsent(identityHex, () => []).add(
+      _PermissionEntry(recordId: record.id, permission: Permission.owner),
     );
     _currentReadKeyId = record.id;
   }
@@ -322,7 +395,26 @@ class AclState {
     final identityHex = record.data['identityHex'] as String?;
     final newPerm = record.data['permissions'] as int?;
     if (identityHex != null && newPerm != null) {
-      _users[identityHex]?.permissions = Permission.fromValue(newPerm);
+      final perm = Permission.fromValue(newPerm);
+      _users[identityHex]?.permissions = perm;
+      _permissionHistory.putIfAbsent(identityHex, () => []).add(
+        _PermissionEntry(recordId: record.id, permission: perm),
+      );
+    }
+  }
+
+  void _applyPermissionChanges(AclRecord record) {
+    final changes = record.data['changes'] as List<Map<String, dynamic>>? ?? [];
+    for (final change in changes) {
+      final identityHex = change['identityHex'] as String?;
+      final newPerm = change['permissions'] as int?;
+      if (identityHex != null && newPerm != null) {
+        final perm = Permission.fromValue(newPerm);
+        _users[identityHex]?.permissions = perm;
+        _permissionHistory.putIfAbsent(identityHex, () => []).add(
+          _PermissionEntry(recordId: record.id, permission: perm),
+        );
+      }
     }
   }
 
@@ -360,6 +452,57 @@ class AclState {
       encryptedReadKey: record.data['encryptedReadKey'] as Uint8List?,
     );
   }
+
+  void _applyAccountsAdd(AclRecord record) {
+    final accounts =
+        record.data['accounts'] as List<Map<String, dynamic>>? ?? [];
+    for (final account in accounts) {
+      final identity = account['identity'] as Uint8List?;
+      if (identity == null) continue;
+      final identityHex = _hexEncode(identity);
+      final perm = Permission.fromValue(
+        account['permissions'] as int? ?? Permission.reader.value,
+      );
+      _users[identityHex] = AclUser(
+        identity: identity,
+        permissions: perm,
+        encryptedReadKey: account['encryptedReadKey'] as Uint8List?,
+      );
+      _permissionHistory.putIfAbsent(identityHex, () => []).add(
+        _PermissionEntry(recordId: record.id, permission: perm),
+      );
+    }
+  }
+
+  void _applyInviteChange(AclRecord record) {
+    final inviteRecordId = record.data['inviteRecordId'] as String?;
+    if (inviteRecordId == null) return;
+    final existing = _invites[inviteRecordId];
+    if (existing == null) return;
+    _invites[inviteRecordId] = AclInvite(
+      recordId: inviteRecordId,
+      inviteKey: existing.inviteKey,
+      isAnyoneCanJoin: existing.isAnyoneCanJoin,
+      permissions: Permission.fromValue(
+        record.data['permissions'] as int? ?? existing.permissions.value,
+      ),
+    );
+  }
+
+  void _applySpaceOptionsChange(AclRecord record) {
+    final options = record.data['options'] as Map<String, dynamic>? ?? {};
+    _spaceOptions.addAll(options);
+    if (options.containsKey('isOneToOne')) {
+      _isOneToOne = options['isOneToOne'] as bool? ?? false;
+    }
+  }
+}
+
+/// Internal: tracks a permission change at a specific record.
+class _PermissionEntry {
+  final String recordId;
+  final Permission permission;
+  const _PermissionEntry({required this.recordId, required this.permission});
 }
 
 String _hexEncode(Uint8List bytes) {

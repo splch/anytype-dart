@@ -26,3 +26,4 @@ export 'hash_utils.dart' show hmacSha512, sha256;
 export 'keys.dart';
 export 'slip10.dart';
 export 'slip21.dart';
+export 'x25519.dart';
