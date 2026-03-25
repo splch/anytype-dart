@@ -13,300 +13,257 @@
 // You should have received a copy of the GNU General Public License
 // along with anytype-dart.  If not, see <https://www.gnu.org/licenses/>.
 
-/// any-sync handshake protocol (Credentials + Proto negotiation).
+/// any-sync credential handshake over TLS.
 ///
 /// Wire format: [type:1][size:4 LE][protobuf payload]
-/// Runs directly over TLS, BEFORE yamux session creation.
+/// Message types: 1=Credentials, 2=Ack, 3=Proto
+///
+/// The credential exchange runs over TLS on a RawSecureSocket.
+/// After completion, the caller switches to raw TCP for yamux.
 library;
 
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import '../crypto/keys.dart';
 
-const int _msgTypeCred = 1;
-const int _msgTypeAck = 2;
-const int _msgTypeProto = 3;
-const int _maxMsgSize = 200 * 1024;
-const int _protoVersion = 9;
-const String _clientVersion = 'anytype-dart/0.1.0';
+/// Protocol version. Must match the server's compatible set.
+const int protoVersion = 8;
 
-/// Ack error codes from the handshake protocol.
-enum HandshakeError {
-  success(0),
-  unexpected(1),
-  invalidCredentials(2),
-  unexpectedPayload(3),
-  skipVerifyNotAllowed(4),
-  deadlineExceeded(5),
-  incompatibleVersion(6),
-  incompatibleProto(7);
+/// Client version string sent during handshake.
+const String clientVersion = 'anytype-dart/0.1.0';
 
-  final int code;
-  const HandshakeError(this.code);
-  static HandshakeError fromCode(int code) {
-    for (final e in values) {
-      if (e.code == code) return e;
-    }
-    return unexpected;
-  }
-}
-
-/// Result of a completed handshake.
-class HandshakeResult {
-  final int remoteVersion;
-  final String remoteClientVersion;
-  final bool snappyEncoding;
-  /// Remaining buffered bytes after handshake (for yamux).
-  final List<int> remainingBytes;
-
-  const HandshakeResult({
-    this.remoteVersion = 0,
-    this.remoteClientVersion = '',
-    this.snappyEncoding = false,
-    this.remainingBytes = const [],
-  });
-}
-
-/// Performs the any-sync handshake over a raw socket (not SecureSocket).
+/// Performs the any-sync credential handshake over a [RawSecureSocket].
 ///
-/// Uses a pre-buffered approach: collects data from the socket into a
-/// buffer, then parses handshake messages from the buffer sequentially.
-class Handshaker {
-  final Socket _socket;
-  final List<int> _buf = [];
-  final Completer<void> _ready = Completer();
-  StreamSubscription<Uint8List>? _sub;
-  bool _closed = false;
-
-  Handshaker(this._socket);
-
-  /// Runs the full handshake: Credentials → Ack → Proto.
-  ///
-  /// After completion, remaining buffered bytes are available in
-  /// [HandshakeResult.remainingBytes] for the yamux layer.
-  Future<HandshakeResult> perform() async {
-    // Set up buffered listener FIRST, before sending anything
-    final dataCompleter = Completer<void>();
-    _sub = _socket.listen(
-      (data) {
-        _buf.addAll(data);
-        if (!dataCompleter.isCompleted) dataCompleter.complete();
-      },
-      onError: (e) {
-        _closed = true;
-        if (!dataCompleter.isCompleted) dataCompleter.completeError(e);
-      },
-      onDone: () {
-        _closed = true;
-        if (!dataCompleter.isCompleted) dataCompleter.complete();
-      },
-    );
-
-    // Send Credentials
-    await _sendMsg(_msgTypeCred, await _buildCredentials());
-
-    // Read Credentials or Ack
-    final (respType, respPayload) = await _readMsg();
-    if (respType == _msgTypeAck) {
-      final err = _decodeAckError(respPayload);
-      throw HandshakeException('Server rejected: ${err.name}');
+/// Returns the server's protocol version and client version string.
+/// After this completes, the caller should stop using the secure socket
+/// and switch to writing raw yamux frames on the underlying [RawSocket].
+Future<({int version, String client})> performCredentialHandshake({
+  required RawSecureSocket secSocket,
+  required Ed25519SigningKey signingKey,
+  required String localPeerId,
+  required String remotePeerId,
+}) async {
+  final buf = <int>[];
+  final sub = secSocket.listen((event) {
+    if (event == RawSocketEvent.read) {
+      final data = secSocket.read();
+      if (data != null) buf.addAll(data);
     }
-    if (respType != _msgTypeCred) {
-      throw HandshakeException('Expected Credentials, got type $respType');
-    }
-    final remoteCred = _decodeCredentials(respPayload);
+  });
 
-    // Send Ack success
-    await _sendMsg(_msgTypeAck, Uint8List(0));
+  try {
+    // Build and send SignedPeerIds credentials
+    final cred = await _buildCredentials(signingKey, localPeerId, remotePeerId);
+    _tlsWrite(secSocket, 1, cred);
 
-    // Read Ack
-    final (ackType, ackPayload) = await _readMsg();
-    if (ackType != _msgTypeAck) {
-      throw HandshakeException('Expected Ack, got type $ackType');
+    // Read server Credentials
+    await _waitFor(buf, 5);
+    final credType = buf[0];
+    if (credType == 2) {
+      throw HandshakeException('Server rejected credentials');
     }
-    final ackErr = _decodeAckError(ackPayload);
-    if (ackErr != HandshakeError.success) {
-      throw HandshakeException('Server Ack error: ${ackErr.name}');
+    if (credType != 1) {
+      throw HandshakeException('Expected Credentials (1), got $credType');
+    }
+    final credSize = _readLeU32(buf, 1);
+    await _waitFor(buf, 5 + credSize);
+    final credPayload = Uint8List.fromList(buf.sublist(5, 5 + credSize));
+    buf.removeRange(0, 5 + credSize);
+
+    // Parse server version
+    final serverInfo = _parseCredentials(credPayload);
+
+    // Send Ack (success)
+    _tlsWrite(secSocket, 2, Uint8List(0));
+
+    // Read server Ack
+    await _waitFor(buf, 5);
+    final ackType = buf[0];
+    final ackSize = _readLeU32(buf, 1);
+    await _waitFor(buf, 5 + ackSize);
+    buf.removeRange(0, 5 + ackSize);
+    if (ackType != 2) {
+      throw HandshakeException('Expected Ack (2), got $ackType');
     }
 
-    // Send Proto (DRPC, no snappy)
-    await _sendMsg(_msgTypeProto, _buildProto());
+    return serverInfo;
+  } finally {
+    await sub.cancel();
+  }
+}
 
-    // Read Proto or Ack
-    final (protoType, protoPayload) = await _readMsg();
-    bool snappy = false;
-    if (protoType == _msgTypeProto) {
-      snappy = _protoHasSnappy(protoPayload);
-    } else if (protoType == _msgTypeAck) {
-      final pe = _decodeAckError(protoPayload);
-      if (pe != HandshakeError.success) {
-        throw HandshakeException('Proto rejected: ${pe.name}');
-      }
+/// Sends the proto handshake as a yamux data frame on stream 1.
+///
+/// Must be called AFTER the credential handshake, on the raw socket.
+/// Returns the raw bytes to write (yamux SYN + proto data frames).
+Uint8List buildYamuxProtoFrames() {
+  final out = BytesBuilder();
+
+  // Yamux frame 1: Window update with SYN flag for stream 1
+  final syn = Uint8List(12);
+  ByteData.sublistView(syn)
+    ..setUint8(0, 0) // yamux version
+    ..setUint8(1, 1) // type = windowUpdate
+    ..setUint16(2, 1, Endian.big) // flags = SYN
+    ..setUint32(4, 1, Endian.big) // streamID = 1
+    ..setUint32(8, 262144, Endian.big); // window = 256KB
+  out.add(syn);
+
+  // Yamux frame 2: Data frame with empty Proto handshake on stream 1
+  // Proto message: type=3, size=0, no payload (triggers server Ack path)
+  final protoMsg = Uint8List.fromList([0x03, 0x00, 0x00, 0x00, 0x00]);
+  final data = Uint8List(12 + protoMsg.length);
+  ByteData.sublistView(data)
+    ..setUint8(0, 0) // yamux version
+    ..setUint8(1, 0) // type = data
+    ..setUint16(2, 0, Endian.big) // flags = 0
+    ..setUint32(4, 1, Endian.big) // streamID = 1
+    ..setUint32(8, protoMsg.length, Endian.big);
+  data.setRange(12, 12 + protoMsg.length, protoMsg);
+  out.add(data);
+
+  return out.toBytes();
+}
+
+/// Parses yamux frames from raw bytes.
+/// Returns a list of (type, flags, streamId, payload) tuples.
+List<({int type, int flags, int streamId, Uint8List? payload})>
+    parseYamuxFrames(List<int> buf) {
+  final frames = <({int type, int flags, int streamId, Uint8List? payload})>[];
+  var pos = 0;
+  while (pos + 12 <= buf.length) {
+    final type = buf[pos + 1];
+    final flags = (buf[pos + 2] << 8) | buf[pos + 3];
+    final streamId = (buf[pos + 4] << 24) |
+        (buf[pos + 5] << 16) |
+        (buf[pos + 6] << 8) |
+        buf[pos + 7];
+    final length = (buf[pos + 8] << 24) |
+        (buf[pos + 9] << 16) |
+        (buf[pos + 10] << 8) |
+        buf[pos + 11];
+    pos += 12;
+
+    Uint8List? payload;
+    if (type == 0 && length > 0 && pos + length <= buf.length) {
+      payload = Uint8List.fromList(buf.sublist(pos, pos + length));
+      pos += length;
     }
-
-    // Detach listener and capture remaining buffer
-    await _sub?.cancel();
-    _sub = null;
-
-    return HandshakeResult(
-      remoteVersion: (remoteCred['version'] as int?) ?? 0,
-      remoteClientVersion: (remoteCred['clientVersion'] as String?) ?? '',
-      snappyEncoding: snappy,
-      remainingBytes: List.from(_buf),
-    );
+    frames.add((type: type, flags: flags, streamId: streamId, payload: payload));
   }
+  return frames;
+}
 
-  Future<void> _sendMsg(int type, Uint8List payload) async {
-    final header = Uint8List(5);
-    header[0] = type;
-    header.buffer.asByteData().setUint32(1, payload.length, Endian.little);
-    _socket.add(header);
-    if (payload.isNotEmpty) _socket.add(payload);
-    await _socket.flush();
-  }
+// --- Internal helpers ---
 
-  Future<(int, Uint8List)> _readMsg() async {
-    await _waitFor(5);
-    final type = _buf[0];
-    final size = _buf[1] | (_buf[2] << 8) | (_buf[3] << 16) | (_buf[4] << 24);
-    if (size > _maxMsgSize) throw HandshakeException('Msg too large: $size');
-    await _waitFor(5 + size);
-    final payload = Uint8List.fromList(_buf.sublist(5, 5 + size));
-    _buf.removeRange(0, 5 + size);
-    return (type, payload);
-  }
+Future<Uint8List> _buildCredentials(
+  Ed25519SigningKey key, String localPeerId, String remotePeerId,
+) async {
+  final buf = BytesBuilder();
 
-  Future<void> _waitFor(int n) async {
-    final deadline = DateTime.now().add(const Duration(seconds: 10));
-    while (_buf.length < n) {
-      if (_closed) {
-        // Server may have sent data AND closed — check buffer one more time
-        if (_buf.length >= n) break;
-        throw SocketException(
-          'Connection closed during handshake (have ${_buf.length} of $n bytes)',
-        );
-      }
-      if (DateTime.now().isAfter(deadline)) {
-        throw HandshakeException('Timeout waiting for $n bytes (have ${_buf.length})');
-      }
-      await Future.delayed(const Duration(milliseconds: 1));
+  // field 1: type = SignedPeerIds (1)
+  buf.addByte(0x08);
+  buf.addByte(0x01);
+
+  // field 2: PayloadSignedPeerIds { identity, sign }
+  final payloadBuf = BytesBuilder();
+  final identityProto = key.publicKey.marshalProto();
+  payloadBuf.addByte(0x0A);
+  _writeVarint(payloadBuf, identityProto.length);
+  payloadBuf.add(identityProto);
+  final sig = await key.sign(
+    Uint8List.fromList(utf8.encode(localPeerId + remotePeerId)),
+  );
+  payloadBuf.addByte(0x12);
+  _writeVarint(payloadBuf, sig.length);
+  payloadBuf.add(sig);
+  final payload = payloadBuf.toBytes();
+  buf.addByte(0x12);
+  _writeVarint(buf, payload.length);
+  buf.add(payload);
+
+  // field 3: version
+  buf.addByte(0x18);
+  _writeVarint(buf, protoVersion);
+
+  // field 4: clientVersion
+  final cv = utf8.encode(clientVersion);
+  buf.addByte(0x22);
+  _writeVarint(buf, cv.length);
+  buf.add(cv);
+
+  return buf.toBytes();
+}
+
+({int version, String client}) _parseCredentials(Uint8List p) {
+  var version = 0;
+  var client = '';
+  var pos = 0;
+  while (pos < p.length) {
+    final tag = p[pos++];
+    final field = tag >> 3;
+    final wt = tag & 0x07;
+    if (wt == 0) {
+      final (v, np) = _readVarint(p, pos);
+      pos = np;
+      if (field == 3) version = v;
+    } else if (wt == 2) {
+      final (len, np) = _readVarint(p, pos);
+      pos = np;
+      if (field == 4) client = utf8.decode(p.sublist(pos, pos + len));
+      pos += len;
     }
   }
+  return (version: version, client: client);
+}
 
-  Ed25519SigningKey? _signingKey;
-  String _localPeerId = '';
-  String _remotePeerId = '';
+void _tlsWrite(RawSecureSocket s, int type, Uint8List payload) {
+  final header = Uint8List(5);
+  header[0] = type;
+  header.buffer.asByteData().setUint32(1, payload.length, Endian.little);
+  s.write(header);
+  if (payload.isNotEmpty) s.write(payload);
+}
 
-  /// Sets the identity for SignedPeerIds authentication.
-  void setIdentity(Ed25519SigningKey key, String localPeerId, String remotePeerId) {
-    _signingKey = key;
-    _localPeerId = localPeerId;
-    _remotePeerId = remotePeerId;
-  }
-
-  Future<Uint8List> _buildCredentials() async {
-    final buf = BytesBuilder();
-
-    if (_signingKey != null && _localPeerId.isNotEmpty) {
-      // SignedPeerIds mode (type=1)
-      buf.addByte(0x08); buf.addByte(0x01); // field 1: type = 1
-
-      // Build PayloadSignedPeerIds
-      final payloadBuf = BytesBuilder();
-      // field 1: identity (proto-encoded public key)
-      final identityProto = _signingKey!.publicKey.marshalProto();
-      payloadBuf.addByte(0x0A); _wv(payloadBuf, identityProto.length);
-      payloadBuf.add(identityProto);
-
-      // field 2: sign = Ed25519Sign(localPeerId + remotePeerId)
-      final message = utf8.encode(_localPeerId + _remotePeerId);
-      final sig = await _signingKey!.sign(Uint8List.fromList(message));
-      payloadBuf.addByte(0x12); _wv(payloadBuf, sig.length);
-      payloadBuf.add(sig);
-      final payload = payloadBuf.toBytes();
-
-      // field 2: payload
-      buf.addByte(0x12); _wv(buf, payload.length);
-      buf.add(payload);
+Future<void> _waitFor(List<int> buf, int n) async {
+  final deadline = DateTime.now().add(const Duration(seconds: 10));
+  while (buf.length < n) {
+    if (DateTime.now().isAfter(deadline)) {
+      throw HandshakeException(
+        'Timeout waiting for $n bytes (have ${buf.length})',
+      );
     }
-    // else: SkipVerify (type=0, omitted)
-
-    // field 3: version
-    buf.addByte(0x18);
-    _wv(buf, _protoVersion);
-    // field 4: clientVersion
-    final cv = utf8.encode(_clientVersion);
-    buf.addByte(0x22);
-    _wv(buf, cv.length);
-    buf.add(cv);
-    return buf.toBytes();
+    await Future.delayed(const Duration(milliseconds: 5));
   }
+}
 
-  Uint8List _buildProto() {
-    final buf = BytesBuilder();
-    buf.addByte(0x10); buf.addByte(0x00); // encoding=None
-    return buf.toBytes();
-  }
+int _readLeU32(List<int> buf, int offset) =>
+    buf[offset] |
+    (buf[offset + 1] << 8) |
+    (buf[offset + 2] << 16) |
+    (buf[offset + 3] << 24);
 
-  HandshakeError _decodeAckError(Uint8List p) {
-    if (p.isEmpty) return HandshakeError.success;
-    if (p.length >= 2 && p[0] == 0x08) return HandshakeError.fromCode(p[1]);
-    return HandshakeError.success;
+void _writeVarint(BytesBuilder buf, int value) {
+  var v = value;
+  while (v > 0x7F) {
+    buf.addByte((v & 0x7F) | 0x80);
+    v >>= 7;
   }
+  buf.addByte(v & 0x7F);
+}
 
-  Map<String, dynamic> _decodeCredentials(Uint8List p) {
-    final r = <String, dynamic>{};
-    var pos = 0;
-    while (pos < p.length) {
-      final tag = p[pos++];
-      final field = tag >> 3;
-      final wt = tag & 0x07;
-      if (wt == 0) {
-        final (v, np) = _rv(p, pos); pos = np;
-        if (field == 3) r['version'] = v;
-      } else if (wt == 2) {
-        final (len, np) = _rv(p, pos); pos = np;
-        if (field == 4) r['clientVersion'] = utf8.decode(p.sublist(pos, pos + len));
-        pos += len;
-      }
-    }
-    return r;
+(int, int) _readVarint(Uint8List buf, int pos) {
+  var result = 0;
+  var shift = 0;
+  while (pos < buf.length) {
+    final byte = buf[pos++];
+    result |= (byte & 0x7F) << shift;
+    if (byte & 0x80 == 0) return (result, pos);
+    shift += 7;
   }
-
-  bool _protoHasSnappy(Uint8List p) {
-    var pos = 0;
-    while (pos < p.length) {
-      final tag = p[pos++];
-      final field = tag >> 3;
-      final wt = tag & 0x07;
-      if (wt == 0) {
-        final (v, np) = _rv(p, pos); pos = np;
-        if (field == 2 && v == 1) return true;
-      } else if (wt == 2) {
-        final (len, np) = _rv(p, pos); pos = np + len;
-      }
-    }
-    return false;
-  }
-
-  void _wv(BytesBuilder b, int v) {
-    while (v > 0x7F) { b.addByte((v & 0x7F) | 0x80); v >>= 7; }
-    b.addByte(v & 0x7F);
-  }
-
-  (int, int) _rv(Uint8List b, int p) {
-    var r = 0, s = 0;
-    while (p < b.length) {
-      final byte = b[p++];
-      r |= (byte & 0x7F) << s;
-      if (byte & 0x80 == 0) return (r, p);
-      s += 7;
-    }
-    return (r, p);
-  }
+  return (result, pos);
 }
 
 class HandshakeException implements Exception {
