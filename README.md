@@ -2,7 +2,7 @@
 
 A cross-platform Flutter client fully compatible with the [Anytype](https://anytype.io) network. Reimplements all middleware from scratch in Dart, depending **only** on MIT-licensed [any-sync](https://github.com/anyproto/any-sync) protocol code.
 
-> **Status:** Prototype — middleware complete, UI scaffold functional, not yet connected to live network nodes.
+> **Status:** Authenticated TCP connection to live any-sync nodes verified. Middleware and UI complete. DRPC RPC calls not yet implemented.
 
 ## Architecture
 
@@ -11,7 +11,7 @@ A cross-platform Flutter client fully compatible with the [Anytype](https://anyt
 │           Flutter UI Layer          │
 │  Material 3, adaptive per platform  │
 ├─────────────────────────────────────┤
-│         anytype-dart Middleware          │
+│        anytype-dart Middleware       │
 │  ┌───────────┐  ┌────────────────┐  │
 │  │  Object   │  │ Block Editor   │  │
 │  │  Model    │  │ Engine         │  │
@@ -24,14 +24,34 @@ A cross-platform Flutter client fully compatible with the [Anytype](https://anyt
 │  │ Layer     │  │                │  │
 │  ├───────────┤  ├────────────────┤  │
 │  │ any-sync  │  │ Local Storage  │  │
-│  │ Protocol  │  │ (In-Memory)    │  │
+│  │ Protocol  │  │ (SQLite)       │  │
 │  └───────────┘  └────────────────┘  │
 ├─────────────────────────────────────┤
-│    Network (P2P + Sync Nodes)       │
+│  Network Transport (TCP/yamux)      │
+│  libp2p TLS · Credentials · DRPC   │
 └─────────────────────────────────────┘
 ```
 
 ## What's Implemented
+
+### Network Transport (`lib/src/net/`)
+
+| Module | Description |
+|--------|-------------|
+| **libp2p TLS** | X.509 certificate generation with Ed25519 identity in extension OID 1.3.6.1.4.1.53594.1.1 (ASN.1 SignedKey). Verified against live any-sync-bundle. |
+| **Credential Handshake** | SignedPeerIds authentication over TLS. Signs `localPeerId + remotePeerId` with Ed25519 identity key. Full Credentials + Ack exchange. |
+| **Yamux + Proto** | After credential handshake, TLS is abandoned and yamux frames flow as plaintext on the raw TCP socket. Proto handshake on first yamux stream triggers server DRPC readiness. |
+
+Connection verified against `any-sync-bundle:1.3.1/any-sync:v0.11.14`:
+
+```
+$ dart run bin/tcp_connect.dart 192.168.0.2 33010
+[1] TCP connected to 192.168.0.2:33010
+[2] TLS upgraded
+[3] Credentials complete — server: any-sync-bundle:1.3.1-2026-02-16/any-sync:v0.11.14 (v8)
+[4] Sent yamux SYN + proto
+[5] Proto Ack received — connection established
+```
 
 ### Crypto Layer (`lib/src/crypto/`)
 
@@ -40,6 +60,7 @@ A cross-platform Flutter client fully compatible with the [Anytype](https://anyt
 | **SLIP-10** | Ed25519 hierarchical deterministic key derivation. Verified against official test vectors. |
 | **SLIP-21** | Symmetric key derivation with label-based paths for per-space and per-object encryption keys. |
 | **Ed25519** | Signing, verification, and protobuf-compatible marshaling. Account/Network string encoding with Base58 + CRC-16 XMODEM. |
+| **X25519** | Ed25519-to-X25519 key conversion (birational Edwards-Montgomery map) and NaCl-box encryption with BLAKE2b-24 nonce derivation. |
 | **AES-256-GCM** | Authenticated encryption matching the any-sync wire format (nonce \|\| ciphertext \|\| tag). |
 | **CID** | IPFS-compatible Content Identifiers (CID v1, DagCBOR, SHA-256) for content addressing. |
 | **Account** | BIP-39 mnemonic generation, seed derivation, and the full Anytype key hierarchy (`m/44'/2046'/index'`). |
@@ -50,8 +71,8 @@ A cross-platform Flutter client fully compatible with the [Anytype](https://anyt
 |--------|-------------|
 | **LexId** | Dense lexicographic ID generation for deterministic change ordering across peers. |
 | **Change** | Merkle DAG node with all protocol fields (CID, parents, snapshot, signature, identity, ACL head). |
-| **Tree** | DAG with attached/unattached tracking, waitlist-based dependency resolution, topological sort, and OrderId assignment. |
-| **ChangeBuilder** | Builds, signs (Ed25519), optionally encrypts (AES-GCM), and verifies changes with CID computation. |
+| **Tree** | DAG with attached/unattached tracking, waitlist-based dependency resolution, topological sort, and OrderId assignment. PreviousIds sorted for determinism. |
+| **ChangeBuilder** | Builds, signs (Ed25519), optionally encrypts (AES-GCM), and verifies changes with CID computation. Uses protobuf wire format matching treechange.proto field numbers. |
 | **ObjectTree** | High-level API: initialize, addContent, addRawChanges from peers, snapshot paths, tree reduction. |
 
 ### Object Model (`lib/src/model/`)
@@ -77,30 +98,24 @@ A cross-platform Flutter client fully compatible with the [Anytype](https://anyt
 | Module | Description |
 |--------|-------------|
 | **Interfaces** | Abstract `ObjectStore`, `ChangeStore`, `SyncStateStore`, `FileStore`, and unified `StorageService`. |
-| **In-Memory** | Complete `MemoryStorageService` implementation with monotonic sequence assignment and OrderId range queries. |
+| **In-Memory** | Complete `MemoryStorageService` implementation for testing. |
+| **SQLite** | Full `SqliteStorageService` with WAL mode, indexed queries (OrderId range scans, addSeq filtering), and `ObjectIndex` for fast search without loading full snapshots. |
 
 ### ACL (`lib/src/acl/`)
 
 | Module | Description |
 |--------|-------------|
 | **Permissions** | Owner / Admin / Writer / Reader / Guest / None with capability checks (canWrite, canRead, canAdmin). |
-| **AclState** | Full state machine: root creation, invite/accept flows, anyone-can-join, account removal, permission changes, read key rotation, ownership transfer, change validation. |
+| **AclState** | Full state machine with all 16 AclContentValue operation types: root creation, invite/accept flows, anyone-can-join, account removal, permission changes, read key rotation, ownership transfer, space options. Strict prevId chain validation and historical permission replay. |
 
 ### Sync (`lib/src/sync/`)
 
 | Module | Description |
 |--------|-------------|
 | **SyncStateMachine** | 8 states (disconnected → connecting → handshake → syncing → idle → receiving/sending → reconnecting). |
-| **SyncClient** | Handles HeadUpdate, FullSyncRequest/Response, space subscriptions, peer management. Abstract `SyncTransport` for plugging in gRPC/WebSocket/P2P. |
+| **SyncClient** | Handles HeadUpdate, FullSyncRequest/Response, space subscriptions, peer management. |
 | **ConflictDetector** | Detects divergent heads — classifies as soft (same identity) or hard (different identities) conflicts. |
 | **SyncOrchestrator** | Ties storage, CRDT trees, and sync client together. Persists changes offline-first, queues for background sync, emits conflict events. |
-
-### Persistent Storage (`lib/src/storage/sqlite_storage.dart`)
-
-| Module | Description |
-|--------|-------------|
-| **SqliteStorageService** | Full SQLite implementation of all storage interfaces. WAL mode, indexed queries (OrderId range scans, addSeq filtering), object index for fast search. |
-| **ObjectIndex** | Lightweight index table for object metadata (name, type, icon, favorite, archive) — enables fast list/search without loading full snapshots. |
 
 ### Flutter UI (`lib/ui/`)
 
@@ -146,13 +161,14 @@ flutter test
 lib/
 ├── main.dart                  # App entry point
 ├── src/
-│   ├── crypto/                # SLIP-10/21, Ed25519, AES-GCM, CID, account keys
-│   ├── crdt/                  # Change DAG, merge, LexId ordering, ObjectTree
+│   ├── net/                   # Network transport (libp2p TLS, handshake, yamux)
+│   ├── crypto/                # SLIP-10/21, Ed25519, X25519, AES-GCM, CID, account keys
+│   ├── crdt/                  # Change DAG, merge, LexId ordering, protobuf encoding
 │   ├── model/                 # Block types, relations, object types, spaces
 │   ├── editor/                # Block operations, BlockEditor engine
-│   ├── storage/               # Storage interfaces + in-memory implementation
+│   ├── storage/               # Storage interfaces, in-memory, SQLite
 │   ├── acl/                   # ACL state machine, permissions
-│   ├── sync/                  # Sync state machine, sync client
+│   ├── sync/                  # Sync state machine, sync client, conflict detection
 │   └── proto/                 # Generated protobuf bindings
 ├── ui/
 │   ├── shell/                 # App scaffold, navigation, state management
@@ -160,6 +176,8 @@ lib/
 │   ├── views/                 # Object list
 │   ├── search/                # Global search
 │   └── settings/              # Settings screen
+bin/
+└── tcp_connect.dart           # Connection probe for live any-sync nodes
 test/
 ├── slip10_test.dart           # SLIP-10 test vectors (both vector sets)
 ├── slip21_test.dart           # SLIP-21 test vectors
@@ -169,9 +187,11 @@ test/
 ├── lexid_test.dart            # Ordering properties, insertions
 ├── change_tree_test.dart      # Tree ops, forks, merges, dependency resolution
 ├── model_test.dart            # Blocks, objects, editor operations
-├── storage_test.dart          # All storage interface tests
+├── storage_test.dart          # In-memory storage interface tests
+├── sqlite_storage_test.dart   # SQLite CRUD, indexing, dedup
 ├── acl_test.dart              # Permission enforcement, invite flows
-└── sync_test.dart             # State machine, sync client
+├── sync_test.dart             # State machine, sync client
+└── conflict_test.dart         # Conflict detection and resolution
 docs/
 └── protocol-notes.md          # Comprehensive any-sync protocol analysis
 ```
@@ -201,10 +221,9 @@ All code is written from scratch in Dart, guided solely by the MIT-licensed any-
 | Package | Purpose |
 |---------|---------|
 | `pointycastle` | HMAC-SHA512, SHA-256 (synchronous) |
-| `cryptography` | Ed25519, AES-GCM, X25519 |
+| `cryptography` | Ed25519, AES-GCM, X25519, BLAKE2b |
 | `bip39` | Mnemonic generation and seed derivation |
-| `protobuf` | Protocol buffer runtime (for generated proto bindings) |
-| `grpc` | gRPC client (for future sync node communication) |
-| `drift` | SQLite ORM (for future persistent storage) |
+| `protobuf` | Protocol buffer runtime |
+| `sqlite3` | SQLite persistent storage (via sqlite3_flutter_libs) |
 | `provider` | State management |
 | `uuid` | Block ID generation |
